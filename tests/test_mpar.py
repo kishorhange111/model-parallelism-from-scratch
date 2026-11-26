@@ -140,3 +140,16 @@ def test_schedules_are_complete_and_1f1b_bounds_memory():
                 )
             assert pp.peak_in_flight(pp.gpipe(p, m, s)) == m
             assert pp.peak_in_flight(pp.one_f_one_b(p, m, s)) == min(p - s, m)
+
+
+def test_bench_runs_and_reports_schedule_memory(tmp_path):
+    import json
+
+    from mpar import bench
+
+    bench.main(["--out", str(tmp_path), "--p", "2", "--d", "16", "--batch", "8",
+                "--ms", "1", "4", "--reps", "1"])  # fmt: skip
+    rows = [json.loads(x) for x in open(tmp_path / "bench.jsonl")]
+    peak = {(r["m"], r["schedule"]): r["peak_stage0"] for r in rows}
+    assert peak == {(1, "gpipe"): 1, (1, "1f1b"): 1, (4, "gpipe"): 4, (4, "1f1b"): 2}
+    assert all(0 <= r["bubble_measured"] < 1 for r in rows)

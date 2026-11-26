@@ -19,6 +19,8 @@ the tests check it.
 
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.distributed as dist
 
@@ -80,13 +82,25 @@ def simulate(schedule, p: int, m: int, tf: float = 1.0, tb: float = 2.0) -> dict
 
 
 def run_pipeline(
-    stage, schedule, microbatches, targets, loss_fn, act_shape, dtype=torch.float32, group=None
+    stage,
+    schedule,
+    microbatches,
+    targets,
+    loss_fn,
+    act_shape,
+    dtype=torch.float32,
+    group=None,
+    stats=None,
 ):
     """Execute ``schedule`` on this rank. ``microbatches`` / ``targets`` are only read on
     the first / last stage; ``act_shape`` is the activation shape passed between
     stages. Gradients accumulate in ``stage``'s parameters with loss / m.
+    If ``stats`` is a dict, the seconds spent in forward and backward compute (not in
+    waiting on ``recv``) are added to ``stats["busy"]``.
     Returns (peak micro-batches held, mean loss on the last stage or None)."""
     s, p = dist.get_rank(group), dist.get_world_size(group)
+    clock = time.perf_counter
+    busy = 0.0
     m = len(targets)
     held, peak, losses, sends = {}, 0, [], []
     for kind, i in schedule(p, m, s):
@@ -97,24 +111,31 @@ def run_pipeline(
                 x = torch.empty(act_shape, dtype=dtype)
                 dist.recv(x, s - 1, group)
                 x.requires_grad_()
+            t0 = clock()
             y = stage(x)
             if s == p - 1:
                 y = loss_fn(y, targets[i]) / m
                 losses.append(float(y) * m)
-            else:
+            busy += clock() - t0
+            if s < p - 1:
                 sends.append(dist.isend(y.detach().contiguous(), s + 1, group))
             held[i] = (x, y)
             peak = max(peak, len(held))
         else:
             x, y = held.pop(i)
             if s == p - 1:
+                t0 = clock()
                 y.backward()
             else:
                 g = torch.empty_like(y)
                 dist.recv(g, s + 1, group)
+                t0 = clock()
                 y.backward(g)
+            busy += clock() - t0
             if s > 0:
                 sends.append(dist.isend(x.grad.contiguous(), s - 1, group))
     for w in sends:
         w.wait()
+    if stats is not None:
+        stats["busy"] = stats.get("busy", 0.0) + busy
     return peak, (sum(losses) / m if losses else None)
